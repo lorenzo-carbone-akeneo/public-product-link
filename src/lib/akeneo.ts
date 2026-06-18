@@ -199,8 +199,12 @@ export function resolveValue(
   );
 }
 
-/** Build an image URL from a media file path stored in Akeneo. */
+/**
+ * Build a proxied image URL for a media file stored in Akeneo.
+ * The browser calls /api/image-proxy?path=... — Next.js adds the Bearer token server-side.
+ */
 export function mediaUrl(data: unknown): string | null {
   if (typeof data !== 'string' || !data) return null;
-  return `${BASE_URL}/api/rest/v1/media-files/${data}/download`;
+  const mediaPath = `/api/rest/v1/media-files/${data}/download`;
+  return `/api/image-proxy?path=${encodeURIComponent(mediaPath)}`;
 }
