@@ -1,0 +1,195 @@
+/**
+ * Server-side Akeneo API client.
+ * The OAuth token is fetched and cached in module scope (re-used across requests
+ * within the same serverless warm instance, re-fetched on cold start or expiry).
+ */
+
+const BASE_URL  = process.env.AKENEO_BASE_URL!;
+const CLIENT_ID = process.env.AKENEO_CLIENT_ID!;
+const SECRET    = process.env.AKENEO_CLIENT_SECRET!;
+const USERNAME  = process.env.AKENEO_USERNAME!;
+const PASSWORD  = process.env.AKENEO_PASSWORD!;
+
+export const LOCALE = process.env.AKENEO_LOCALE ?? 'en_US';
+export const SCOPE  = process.env.AKENEO_SCOPE  ?? 'ecommerce';
+
+// ── Types ──────────────────────────────────────────────────────────────────
+
+export type AttributeValue = {
+  locale: string | null;
+  scope:  string | null;
+  data:   unknown;
+};
+
+export type Product = {
+  uuid:       string;
+  identifier: string;
+  enabled:    boolean;
+  family:     string | null;
+  categories: string[];
+  parent:     string | null;
+  values:     Record<string, AttributeValue[]>;
+};
+
+export type ProductModel = {
+  code:       string;
+  family:     string | null;
+  family_variant: string | null;
+  categories: string[];
+  parent:     string | null;
+  values:     Record<string, AttributeValue[]>;
+};
+
+export type AkeneoAttribute = {
+  code:               string;
+  type:               string;
+  labels:             Record<string, string>;
+  group:              string;
+  localizable:        boolean;
+  scopable:           boolean;
+  available_locales?: string[];
+};
+
+export type AkeneoAttributeGroup = {
+  code:   string;
+  labels: Record<string, string>;
+  attributes: string[];
+  sort_order: number;
+};
+
+export type AkeneoFamily = {
+  code:        string;
+  labels:      Record<string, string>;
+  attributes:  string[];
+  attribute_as_label: string;
+  attribute_as_image: string | null;
+};
+
+export type AssetValue = {
+  locale: string | null;
+  scope:  string | null;
+  data:   string;   // asset code
+};
+
+// ── Token cache ────────────────────────────────────────────────────────────
+
+let cachedToken: string | null = null;
+let tokenExpiry = 0;
+
+async function getToken(): Promise<string> {
+  if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
+
+  const res = await fetch(`${BASE_URL}/api/oauth/v1/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'password',
+      client_id:     CLIENT_ID,
+      client_secret: SECRET,
+      username:      USERNAME,
+      password:      PASSWORD,
+    }),
+    cache: 'no-store',
+  });
+
+  if (!res.ok) throw new Error(`Akeneo auth failed: ${res.status}`);
+  const json = await res.json() as { access_token: string; expires_in: number };
+  cachedToken = json.access_token;
+  tokenExpiry = Date.now() + (json.expires_in - 60) * 1000; // renew 60 s early
+  return cachedToken;
+}
+
+async function akeneoFetch<T>(path: string): Promise<T> {
+  const token = await getToken();
+  const res = await fetch(`${BASE_URL}${path}`, {
+    headers: { Authorization: `Bearer ${token}` },
+    next: { revalidate: 60 },   // ISR: re-validate every 60 s
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Akeneo ${path} → ${res.status}: ${body}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+// ── Public API ─────────────────────────────────────────────────────────────
+
+/** Fetch a simple product by identifier (SKU). */
+export async function getProduct(sku: string): Promise<Product> {
+  return akeneoFetch<Product>(
+    `/api/rest/v1/products/${encodeURIComponent(sku)}` +
+    `?with_attribute_options=true`
+  );
+}
+
+/** Fetch a product model by code. */
+export async function getProductModel(code: string): Promise<ProductModel> {
+  return akeneoFetch<ProductModel>(
+    `/api/rest/v1/product-models/${encodeURIComponent(code)}`
+  );
+}
+
+/** Fetch direct variant products of a product model. */
+export async function getVariants(parentCode: string): Promise<Product[]> {
+  const search = encodeURIComponent(
+    JSON.stringify({ parent: [{ operator: '=', value: parentCode }] })
+  );
+  const res = await akeneoFetch<{ _embedded: { items: Product[] } }>(
+    `/api/rest/v1/products?search=${search}&limit=50`
+  );
+  return res._embedded.items;
+}
+
+type AttrPage = { _embedded: { items: AkeneoAttribute[] }; _links: { next?: { href: string } } };
+
+/** Fetch all attributes for a family (returns a map by code). */
+export async function getFamilyAttributes(
+  familyCode: string
+): Promise<Map<string, AkeneoAttribute>> {
+  const map = new Map<string, AkeneoAttribute>();
+  let path: string | null =
+    `/api/rest/v1/attributes?families=${familyCode}&limit=100`;
+
+  while (path) {
+    const page: AttrPage = await akeneoFetch<AttrPage>(path);
+    for (const attr of page._embedded.items) map.set(attr.code, attr);
+    const next: string | null = page._links.next?.href ?? null;
+    path = next ? next.replace(BASE_URL, '') : null;
+  }
+  return map;
+}
+
+/** Fetch attribute groups (for organising the attribute display). */
+export async function getAttributeGroups(): Promise<AkeneoAttributeGroup[]> {
+  type Page = { _embedded: { items: AkeneoAttributeGroup[] } };
+  const page = await akeneoFetch<Page>(`/api/rest/v1/attribute-groups?limit=100`);
+  return page._embedded.items.sort((a, b) => a.sort_order - b.sort_order);
+}
+
+/** Fetch a single family. */
+export async function getFamily(code: string): Promise<AkeneoFamily> {
+  return akeneoFetch<AkeneoFamily>(`/api/rest/v1/families/${code}`);
+}
+
+/** Resolve the best-match scalar value for a given locale/scope. */
+export function resolveValue(
+  values: AttributeValue[] | undefined,
+  locale: string,
+  scope: string
+): unknown {
+  if (!values?.length) return null;
+  return (
+    values.find(v => v.locale === locale  && v.scope === scope)?.data  ??
+    values.find(v => v.locale === locale  && v.scope === null)?.data   ??
+    values.find(v => v.locale === null    && v.scope === scope)?.data  ??
+    values.find(v => v.locale === null    && v.scope === null)?.data   ??
+    values[0]?.data ??
+    null
+  );
+}
+
+/** Build an image URL from a media file path stored in Akeneo. */
+export function mediaUrl(data: unknown): string | null {
+  if (typeof data !== 'string' || !data) return null;
+  return `${BASE_URL}/api/rest/v1/media-files/${data}/download`;
+}
