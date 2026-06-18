@@ -199,12 +199,76 @@ export function resolveValue(
   );
 }
 
-/**
- * Build a proxied image URL for a media file stored in Akeneo.
- * The browser calls /api/image-proxy?path=... — Next.js adds the Bearer token server-side.
- */
+/** @deprecated — use resolveAssetImageUrls instead */
 export function mediaUrl(data: unknown): string | null {
   if (typeof data !== 'string' || !data) return null;
   const mediaPath = `/api/rest/v1/media-files/${data}/download`;
   return `/api/image-proxy?path=${encodeURIComponent(mediaPath)}`;
+}
+
+// ── Asset API ──────────────────────────────────────────────────────────────
+
+type AssetRecord = {
+  code: string;
+  values: Record<string, Array<{ locale: string | null; scope: string | null; data: unknown }>>;
+};
+
+type ExtendedAttributeValue = AttributeValue & {
+  attribute_type?: string;
+  reference_data_name?: string;
+};
+
+/**
+ * Scan product values for pim_catalog_asset_collection attributes,
+ * fetch each asset, and return the public medialink URLs.
+ * Works for any asset family that has a `media_link` attribute as main media.
+ */
+export async function resolveAssetImageUrls(
+  values: Record<string, AttributeValue[]>,
+  maxImages = 8
+): Promise<string[]> {
+  const urls: string[] = [];
+
+  for (const attrValues of Object.values(values)) {
+    if (!attrValues?.length) continue;
+    const first = attrValues[0] as ExtendedAttributeValue;
+    if (first.attribute_type !== 'pim_catalog_asset_collection') continue;
+
+    const familyCode = first.reference_data_name;
+    if (!familyCode) continue;
+
+    const assetCodes = first.data as string[];
+    if (!Array.isArray(assetCodes)) continue;
+
+    // Fetch asset family to discover which attribute holds the public URL
+    let mediaLinkAttrCode = 'medialink'; // sensible default
+    try {
+      const family = await akeneoFetch<{ attribute_as_main_media: string }>(
+        `/api/rest/v1/asset-families/${familyCode}`
+      );
+      // Prefer attribute_as_main_media if it's a media_link type; we'll verify per-asset
+      mediaLinkAttrCode = family.attribute_as_main_media ?? 'medialink';
+    } catch { /* fall back to default */ }
+
+    for (const code of assetCodes.slice(0, maxImages - urls.length)) {
+      try {
+        const asset = await akeneoFetch<AssetRecord>(
+          `/api/rest/v1/asset-families/${familyCode}/assets/${encodeURIComponent(code)}`
+        );
+        // Try the main media attribute first, then 'medialink' as fallback
+        const candidates = [mediaLinkAttrCode, 'medialink', 'media_link', 'url'];
+        for (const attr of candidates) {
+          const val = asset.values[attr]?.[0]?.data;
+          if (typeof val === 'string' && val.startsWith('http')) {
+            urls.push(val);
+            break;
+          }
+        }
+      } catch { /* skip this asset */ }
+      if (urls.length >= maxImages) break;
+    }
+    if (urls.length >= maxImages) break;
+  }
+
+  return urls;
 }

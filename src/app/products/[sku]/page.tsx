@@ -8,7 +8,7 @@ import {
   getAttributeGroups,
   getFamily,
   resolveValue,
-  mediaUrl,
+  resolveAssetImageUrls,
   LOCALE,
   SCOPE,
   type Product,
@@ -125,18 +125,8 @@ export default async function ProductPage(
     String(resolveValue(mergedValues['title'], LOCALE, SCOPE) ?? '') ||
     product.identifier;
 
-  // 7. Collect images (pim_catalog_image attributes + attribute_as_image)
-  const imageUrls: string[] = [];
-  const imageAttrCodes = new Set<string>();
-  if (family?.attribute_as_image) imageAttrCodes.add(family.attribute_as_image);
-  for (const [code, attr] of attrMap) {
-    if (attr.type === 'pim_catalog_image') imageAttrCodes.add(code);
-  }
-  for (const code of imageAttrCodes) {
-    const raw = resolveValue(mergedValues[code], LOCALE, SCOPE);
-    const url = mediaUrl(raw);
-    if (url) imageUrls.push(url);
-  }
+  // 7. Collect images from asset collections (medialink = public URL, no auth needed)
+  const imageUrls = await resolveAssetImageUrls(mergedValues);
 
   // 8. Group attributes for display (skip images and internal attrs)
   const SKIP_TYPES = new Set(['pim_catalog_image', 'pim_catalog_file', 'pim_assets_collection']);
